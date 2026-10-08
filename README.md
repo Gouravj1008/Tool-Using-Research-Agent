@@ -120,9 +120,34 @@ Expected shape:
 `agent.research.run_research(question)` implements a bounded manual
 decide-act-observe loop. Gemini returns one JSON action at a time using only
 `search`, `fetch`, or `finish`. Tool arguments are validated before execution,
-unknown actions are rejected, and final citations are restricted to URLs that
-were actually fetched. Fetched page content is condensed into the scratchpad
-instead of being resent in full.
+unknown actions are rejected, and final citations are restricted to source IDs
+for pages that were actually fetched. A finish call must include at least one
+valid fetched source ID; URLs, search-only snippets, and unknown IDs are
+rejected.
+
+## Research scratchpad
+
+`agent.scratchpad.Scratchpad` stores structured, bounded findings separately
+from the raw conversation. A fetched page is reduced to a compact finding with
+its source ID, URL, title, claims, and optional discovery query. The raw page
+content is then discarded from active scratchpad context.
+
+Before:
+
+```text
+model context = full webpage HTML/text, potentially thousands of characters
+```
+
+After:
+
+```text
+model context = {"source_id":"a1b2c3d4e5f6","url":"https://example.com",
+                 "title":"Example","finding":"Compact finding...",
+                 "claims":[],"query":"example"}
+```
+
+The scratchpad enforces both a maximum finding count and maximum rendered
+context size, evicting the oldest findings when either bound is reached.
 
 Obtain a Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey).
 Free-tier availability and quotas are controlled by Google and may change.

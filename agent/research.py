@@ -10,11 +10,11 @@ from urllib.parse import urlparse
 from app.tools import fetch_page, web_search
 
 from .llm import generate_response
+from .scratchpad import Scratchpad
 
 LOGGER = logging.getLogger(__name__)
 MAX_ITERATIONS = 6
 MAX_TOTAL_TOKENS = 20_000
-MAX_SCRATCHPAD_CHARS = 30_000
 ALLOWED_TOOLS = {"search", "fetch", "finish"}
 
 
@@ -23,12 +23,12 @@ def run_research(question: str) -> dict[str, Any]:
     if not question.strip():
         return {"error": "Research question must not be empty.", "summary": "", "sources": []}
 
-    scratchpad = ""
-    fetched_sources: dict[str, dict[str, str]] = {}
+    scratchpad = Scratchpad()
+    fetched_sources: dict[str, str] = {}
     total_tokens = 0
 
     for _ in range(MAX_ITERATIONS):
-        prompt = _build_prompt(question, scratchpad)
+        prompt = _build_prompt(question, scratchpad.render_context())
         llm_response = generate_response(prompt)
         if llm_response.get("error"):
             return {"error": llm_response["error"], "summary": "", "sources": []}
@@ -51,17 +51,24 @@ def run_research(question: str) -> dict[str, Any]:
         action = decision["action"]
         arguments = decision["arguments"]
         if action == "finish":
-            return _finish_response(arguments, fetched_sources)
+            finish_result = _finish_response(arguments, fetched_sources)
+            if "error" in finish_result:
+                return finish_result
+            return finish_result
 
         observation = _execute_tool(action, arguments)
-        if action == "fetch" and not observation.get("error"):
+        if action == "fetch" and observation.get("success") is True:
             url = observation.get("url")
             if isinstance(url, str):
-                fetched_sources[url] = {
-                    "title": str(observation.get("title", "")),
-                    "content": str(observation.get("content", "")),
-                }
-        scratchpad = _append_observation(scratchpad, action, observation)
+                source_id = scratchpad.add_finding(
+                    url=url,
+                    title=str(observation.get("title", "")),
+                    finding=str(observation.get("content", "")),
+                    claims=[],
+                )
+                fetched_sources[source_id] = url
+        elif action == "search":
+            _append_search_observation(scratchpad, observation)
 
     return {"error": "Research iteration limit reached.", "summary": "", "sources": []}
 
@@ -78,14 +85,14 @@ Scratchpad observations:
 Choose exactly one action and return only valid JSON:
 {{"action":"search","arguments":{{"query":"..."}}}}
 {{"action":"fetch","arguments":{{"url":"..."}}}}
-{{"action":"finish","arguments":{{"summary":"...","sources":["..."]}}}}
+{{"action":"finish","arguments":{{"summary":"...","sources":["source-id"]}}}}
 
 Rules:
 - Use only the tools search, fetch, and finish.
 - Validate arguments mentally before choosing an action.
 - Use search for research queries and fetch only URLs returned by search.
 - Treat tool failures as observations and continue when useful.
-- When finishing, cite only URLs that were actually fetched.
+- When finishing, cite only source IDs for pages that were actually fetched.
 - Never invent facts, URLs, or citations.
 - Do not repeat raw page content in the scratchpad; keep observations concise.
 """
@@ -122,32 +129,38 @@ def _execute_tool(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unsupported tool: {action}")
 
 
-def _append_observation(
-    scratchpad: str,
-    action: str,
-    observation: dict[str, Any],
-) -> str:
-    if action == "fetch" and not observation.get("error"):
-        compact = {
-            "url": observation.get("url"),
-            "title": observation.get("title"),
-            "content": str(observation.get("content", ""))[:2_000],
-        }
-    elif action == "search":
-        compact = {
-            "query": observation.get("query"),
-            "results": observation.get("results", [])[:5],
-            "error": observation.get("error"),
-        }
-    else:
-        compact = observation
-    entry = json.dumps({"tool": action, "observation": compact}, ensure_ascii=True)
-    return (scratchpad + "\n" + entry)[-MAX_SCRATCHPAD_CHARS:]
+def _append_search_observation(scratchpad: Scratchpad, observation: dict[str, Any]) -> None:
+    """Store search metadata as a compact finding without page content."""
+    results = observation.get("results", [])
+    if not isinstance(results, list) or not results:
+        return
+    first = results[0]
+    if not isinstance(first, dict) or not isinstance(first.get("url"), str):
+        return
+    scratchpad.add_finding(
+        url=first["url"],
+        title=str(first.get("title", "")),
+        finding=str(first.get("snippet") or first.get("title") or "Search result"),
+        claims=[],
+        query=str(observation.get("query", "")),
+    )
 
 
-def _finish_response(arguments: dict[str, Any], fetched_sources: dict[str, dict[str, str]]) -> dict[str, Any]:
-    sources = [url for url in arguments["sources"] if url in fetched_sources]
-    return {"summary": arguments["summary"], "sources": sources}
+def _finish_response(
+    arguments: dict[str, Any],
+    fetched_sources: dict[str, str],
+) -> dict[str, Any]:
+    source_ids = arguments["sources"]
+    if not source_ids:
+        return {"error": "Finish requires at least one fetched source.", "summary": "", "sources": []}
+    unknown_ids = [source_id for source_id in source_ids if source_id not in fetched_sources]
+    if unknown_ids:
+        return {
+            "error": "Finish referenced an unknown or unfetched source.",
+            "summary": "",
+            "sources": [],
+        }
+    return {"summary": arguments["summary"], "sources": source_ids}
 
 
 def _is_nonempty_string(value: Any) -> bool:
