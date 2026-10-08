@@ -5,13 +5,17 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 import requests
+from bs4 import BeautifulSoup
 
 LOGGER = logging.getLogger(__name__)
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 DEFAULT_TIMEOUT_SECONDS = 10
+MAX_PAGE_CONTENT_LENGTH = 50_000
 
 
 def web_search(query: str) -> dict[str, Any]:
@@ -27,7 +31,6 @@ def web_search(query: str) -> dict[str, Any]:
         response["error"] = "Search query must not be empty."
         LOGGER.warning("Search skipped because the query is empty.")
         return response
-
     api_key = os.getenv("BRAVE_SEARCH_API_KEY")
     if not api_key:
         response["error"] = "BRAVE_SEARCH_API_KEY is not configured."
@@ -56,6 +59,67 @@ def web_search(query: str) -> dict[str, Any]:
         LOGGER.info("Search returned no results for query %r.", normalized_query)
 
     return response
+
+
+def fetch_page(url: str) -> dict[str, str]:
+    """Fetch a webpage and return its title and readable text content."""
+    response: dict[str, str] = {"url": url, "title": "", "content": ""}
+
+    if not _is_valid_http_url(url):
+        response["error"] = "URL must be a valid HTTP or HTTPS URL."
+        LOGGER.warning("Page fetch skipped because the URL is invalid: %r.", url)
+        return response
+
+    try:
+        page_response = httpx.get(
+            url,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+        page_response.raise_for_status()
+        title, content = _parse_page(page_response.text)
+        if not content:
+            response["error"] = "Page did not contain readable content."
+            LOGGER.info("Page contained no readable content: %s", url)
+            return response
+        response["title"] = title
+        response["content"] = content[:MAX_PAGE_CONTENT_LENGTH]
+    except httpx.TimeoutException:
+        response["error"] = "Page request timed out."
+        LOGGER.exception("Page request timed out for URL %r.", url)
+    except httpx.HTTPStatusError:
+        response["error"] = "Page returned an HTTP error."
+        LOGGER.exception("Page returned an HTTP error for URL %r.", url)
+    except httpx.RequestError:
+        response["error"] = "Page request failed."
+        LOGGER.exception("Page request failed for URL %r.", url)
+    except (TypeError, ValueError):
+        response["error"] = "Page could not be parsed."
+        LOGGER.exception("Page parsing failed for URL %r.", url)
+
+    return response
+
+
+def _is_valid_http_url(url: str) -> bool:
+    """Return whether a URL has an HTTP(S) scheme and a host."""
+    if not isinstance(url, str):
+        return False
+    parsed_url = urlparse(url.strip())
+    return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _parse_page(html: str) -> tuple[str, str]:
+    """Extract the page title and readable body text from HTML."""
+    if not isinstance(html, str):
+        raise TypeError("Page response must contain text.")
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup(["script", "style", "noscript", "template"]):
+        element.decompose()
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if soup.title:
+        soup.title.decompose()
+    content = " ".join(soup.get_text(" ", strip=True).split())
+    return title, content
 
 
 def _search_brave(query: str, api_key: str, *, timeout: int) -> dict[str, Any]:
