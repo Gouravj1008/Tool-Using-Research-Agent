@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 import requests
 from bs4 import BeautifulSoup
+from trafilatura import extract
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,12 +62,17 @@ def web_search(query: str) -> dict[str, Any]:
     return response
 
 
-def fetch_page(url: str) -> dict[str, str]:
-    """Fetch a webpage and return its title and readable text content."""
-    response: dict[str, str] = {"url": url, "title": "", "content": ""}
+def fetch(url: str) -> dict[str, Any]:
+    """Fetch a webpage and return readable content as an observation."""
+    response: dict[str, Any] = {
+        "success": False,
+        "url": url,
+        "title": "",
+        "content": "",
+    }
 
     if not _is_valid_http_url(url):
-        response["error"] = "URL must be a valid HTTP or HTTPS URL."
+        response["error"] = "Invalid URL."
         LOGGER.warning("Page fetch skipped because the URL is invalid: %r.", url)
         return response
 
@@ -77,27 +83,34 @@ def fetch_page(url: str) -> dict[str, str]:
             follow_redirects=True,
         )
         page_response.raise_for_status()
-        title, content = _parse_page(page_response.text)
+        title, content = _extract_page(page_response.text)
         if not content:
-            response["error"] = "Page did not contain readable content."
+            response["error"] = "Readable content extraction failed."
             LOGGER.info("Page contained no readable content: %s", url)
             return response
+        response["success"] = True
         response["title"] = title
         response["content"] = content[:MAX_PAGE_CONTENT_LENGTH]
     except httpx.TimeoutException:
-        response["error"] = "Page request timed out."
+        response["error"] = "Request timed out."
         LOGGER.exception("Page request timed out for URL %r.", url)
-    except httpx.HTTPStatusError:
-        response["error"] = "Page returned an HTTP error."
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        response["error"] = f"HTTP {status_code}"
         LOGGER.exception("Page returned an HTTP error for URL %r.", url)
     except httpx.RequestError:
-        response["error"] = "Page request failed."
+        response["error"] = "Request failed."
         LOGGER.exception("Page request failed for URL %r.", url)
     except (TypeError, ValueError):
-        response["error"] = "Page could not be parsed."
+        response["error"] = "Content extraction failed."
         LOGGER.exception("Page parsing failed for URL %r.", url)
 
     return response
+
+
+def fetch_page(url: str) -> dict[str, Any]:
+    """Backward-compatible wrapper for the fetch tool."""
+    return fetch(url)
 
 
 def _is_valid_http_url(url: str) -> bool:
@@ -108,18 +121,14 @@ def _is_valid_http_url(url: str) -> bool:
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
 
 
-def _parse_page(html: str) -> tuple[str, str]:
-    """Extract the page title and readable body text from HTML."""
-    if not isinstance(html, str):
-        raise TypeError("Page response must contain text.")
+def _extract_page(html: str) -> tuple[str, str]:
+    """Extract title and main readable content from an HTML document."""
+    if not isinstance(html, str) or not html.strip():
+        raise ValueError("HTML content must not be empty.")
     soup = BeautifulSoup(html, "html.parser")
-    for element in soup(["script", "style", "noscript", "template"]):
-        element.decompose()
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    if soup.title:
-        soup.title.decompose()
-    content = " ".join(soup.get_text(" ", strip=True).split())
-    return title, content
+    content = extract(html, include_comments=False, include_tables=True)
+    return title, " ".join(content.split()) if content else ""
 
 
 def _search_brave(query: str, api_key: str, *, timeout: int) -> dict[str, Any]:

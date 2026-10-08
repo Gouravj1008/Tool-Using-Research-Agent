@@ -7,11 +7,10 @@ tools and citing the sources it fetches.
 
 ## Current development stage
 
-This repository is currently at **Part 03 - Fetch Page Tool**. It contains the
-basic project foundation, an independent `web_search(query)` tool, and an
-independent `fetch_page(url)` tool. Agent planning, LangGraph, summarization,
-citation validation, LLM integration, and final answer generation have not
-been implemented yet.
+This repository is currently at **Part 04 - Gemini Research Loop**. It contains
+the basic project foundation, independent search and page-fetching tools, and a
+small manual Gemini decide-act-observe loop. LangGraph and a separate
+`summarize_source` tool have not been implemented.
 
 ## Planned architecture
 
@@ -23,13 +22,14 @@ The project is expected to grow into the following high-level components:
 4. A response layer that summarizes findings and cites fetched sources.
 5. Tests covering the agent, tools, and response behavior.
 
-Only the web search and page fetching components are implemented in the current
-stage. The remaining components are planned only.
+Only the web search, page fetching, and manual research loop are implemented in
+the current stage. The remaining components are planned only.
 
 ## Requirements
 
 - Python 3.11 or newer
 - A Brave Search API key
+- A Gemini API key
 
 ## Installation
 
@@ -43,16 +43,18 @@ python -m pip install -r requirements.txt
 ```
 
 The current tools use `requests` and `httpx` for HTTPS requests, plus
-BeautifulSoup for HTML parsing. Copy
+BeautifulSoup for HTML parsing. The Gemini provider uses the official
+`google-genai` SDK. Copy
 `.env.example` to `.env` and set the key used by the Brave Search API:
 
 ```text
 BRAVE_SEARCH_API_KEY=your_brave_search_api_key
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-2.0-flash
 ```
 
-The application reads this variable from the process environment. Loading a
-`.env` file is intentionally not implemented yet; export the variable in your
-shell or configure it through your runtime environment.
+The application loads these values from `.env` using `python-dotenv`. Never
+commit `.env`; it is ignored by Git.
 
 ## Web search tool
 
@@ -78,25 +80,28 @@ results return an empty `results` list with an explanatory `error` or
 
 ## Page fetching tool
 
-`app.tools.fetch_page(url)` fetches an HTTP(S) page and returns readable text:
+`app.tools.fetch(url)` fetches an HTTP(S) page and returns an observation:
 
 ```python
 {
+    "success": True,
     "url": "https://example.com",
     "title": "Example Domain",
     "content": "Example Domain This domain is for use in illustrative examples..."
 }
 ```
 
-The tool removes common non-readable elements such as scripts and styles,
-normalizes whitespace, and limits returned content to 50,000 characters.
-Invalid URLs, timeouts, HTTP errors, empty pages, request failures, and parsing
-failures return an explanatory `error` field without raising to the caller.
+The tool uses `trafilatura` to extract readable content and limits it to
+50,000 characters. Invalid URLs, timeouts, HTTP errors such as `HTTP 403`,
+`HTTP 404`, and `HTTP 500`, empty pages, request failures, and extraction
+failures return `success: False` with an explanatory `error` field instead of
+raising an exception. The previous `fetch_page(url)` name remains as a
+compatibility wrapper.
 
 Example usage:
 
 ```powershell
-python -c "from app.tools import fetch_page; print(fetch_page('https://example.com'))"
+python -c "from app.tools import fetch; print(fetch('https://example.com'))"
 ```
 
 Expected shape:
@@ -108,6 +113,19 @@ Expected shape:
     "content": "Example Domain This domain is for use in illustrative examples..."
 }
 ```
+
+## Gemini research loop
+
+`agent.llm.generate_response` is the isolated Gemini provider adapter.
+`agent.research.run_research(question)` implements a bounded manual
+decide-act-observe loop. Gemini returns one JSON action at a time using only
+`search`, `fetch`, or `finish`. Tool arguments are validated before execution,
+unknown actions are rejected, and final citations are restricted to URLs that
+were actually fetched. Fetched page content is condensed into the scratchpad
+instead of being resent in full.
+
+Obtain a Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey).
+Free-tier availability and quotas are controlled by Google and may change.
 
 ## Run the current version
 
@@ -123,6 +141,15 @@ Expected output:
 Tool-Using Research Agent foundation is working.
 ```
 
+Run a research question:
+
+```powershell
+python -m app.main "What are the main benefits of Python 3.11?"
+```
+
+The output is a dictionary containing either `summary` and fetched `sources`,
+or a non-sensitive `error` message.
+
 ## Known limitations
 
 - Results depend on the Brave Search API and require a valid API key.
@@ -130,5 +157,7 @@ Tool-Using Research Agent foundation is working.
 - Provider-specific normalization currently supports Brave Search only.
 - Page fetching uses a fixed 10-second timeout and a 50,000-character content
   limit.
+- Gemini model, quotas, API errors, and rate limits depend on the configured
+  Google account and free-tier availability.
 - There is no retry, caching, ranking, summarization, or citation validation
   yet.

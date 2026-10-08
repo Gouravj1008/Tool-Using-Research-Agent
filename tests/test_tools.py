@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import requests
 import httpx
 
-from app.tools import MAX_PAGE_CONTENT_LENGTH, fetch_page, web_search
+from app.tools import MAX_PAGE_CONTENT_LENGTH, fetch, fetch_page, web_search
 
 
 class WebSearchTests(unittest.TestCase):
@@ -94,32 +94,52 @@ class FetchPageTests(unittest.TestCase):
         """
         mock_get.return_value = mock_response
 
-        result = fetch_page("https://example.com/page")
+        result = fetch("https://example.com/page")
 
+        self.assertTrue(result["success"])
         self.assertEqual(result["url"], "https://example.com/page")
         self.assertEqual(result["title"], "Example page")
-        self.assertEqual(result["content"], "Heading Readable content.")
+        self.assertIn("Heading", result["content"])
+        self.assertIn("Readable content.", result["content"])
         self.assertNotIn("error", result)
         mock_response.raise_for_status.assert_called_once_with()
 
     @patch("app.tools.httpx.get")
     def test_invalid_url_returns_error_without_request(self, mock_get: Mock) -> None:
-        result = fetch_page("not-a-url")
+        result = fetch("not-a-url")
 
+        self.assertFalse(result["success"])
         self.assertEqual(result["content"], "")
-        self.assertIn("error", result)
+        self.assertEqual(result["error"], "Invalid URL.")
         mock_get.assert_not_called()
 
     @patch("app.tools.httpx.get", side_effect=httpx.TimeoutException("slow response"))
     def test_timeout_returns_error(self, mock_get: Mock) -> None:
-        result = fetch_page("https://example.com")
+        result = fetch("https://example.com")
 
-        self.assertEqual(result["error"], "Page request timed out.")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Request timed out.")
         self.assertEqual(result["content"], "")
         mock_get.assert_called_once()
 
     @patch("app.tools.httpx.get")
-    def test_http_error_returns_error(self, mock_get: Mock) -> None:
+    def test_http_error_returns_observation(self, mock_get: Mock) -> None:
+        mock_response = Mock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "not found",
+            request=httpx.Request("GET", "https://example.com"),
+            response=httpx.Response(403),
+        )
+        mock_get.return_value = mock_response
+
+        result = fetch("https://example.com")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "HTTP 403")
+        self.assertEqual(result["content"], "")
+
+    @patch("app.tools.httpx.get")
+    def test_not_found_returns_observation(self, mock_get: Mock) -> None:
         mock_response = Mock()
         mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
             "not found",
@@ -128,10 +148,23 @@ class FetchPageTests(unittest.TestCase):
         )
         mock_get.return_value = mock_response
 
-        result = fetch_page("https://example.com")
+        result = fetch("https://example.com/missing")
 
-        self.assertEqual(result["error"], "Page returned an HTTP error.")
-        self.assertEqual(result["content"], "")
+        self.assertEqual(result["error"], "HTTP 404")
+
+    @patch("app.tools.httpx.get")
+    def test_server_error_returns_observation(self, mock_get: Mock) -> None:
+        mock_response = Mock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "server error",
+            request=httpx.Request("GET", "https://example.com"),
+            response=httpx.Response(500),
+        )
+        mock_get.return_value = mock_response
+
+        result = fetch("https://example.com/failure")
+
+        self.assertEqual(result["error"], "HTTP 500")
 
     @patch("app.tools.httpx.get")
     def test_empty_page_returns_error(self, mock_get: Mock) -> None:
@@ -139,11 +172,12 @@ class FetchPageTests(unittest.TestCase):
         mock_response.text = "<html><body> </body></html>"
         mock_get.return_value = mock_response
 
-        result = fetch_page("https://example.com/empty")
+        result = fetch("https://example.com/empty")
 
-        self.assertEqual(result["error"], "Page did not contain readable content.")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Readable content extraction failed.")
 
-    @patch("app.tools._parse_page", side_effect=ValueError("malformed HTML"))
+    @patch("app.tools._extract_page", side_effect=ValueError("malformed HTML"))
     @patch("app.tools.httpx.get")
     def test_parsing_failure_returns_error(
         self,
@@ -154,9 +188,10 @@ class FetchPageTests(unittest.TestCase):
         mock_response.text = "<html>"
         mock_get.return_value = mock_response
 
-        result = fetch_page("https://example.com/malformed")
+        result = fetch("https://example.com/malformed")
 
-        self.assertEqual(result["error"], "Page could not be parsed.")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Content extraction failed.")
         mock_parse_page.assert_called_once_with("<html>")
 
     @patch("app.tools.httpx.get")
@@ -165,6 +200,26 @@ class FetchPageTests(unittest.TestCase):
         mock_response.text = f"<p>{'x' * (MAX_PAGE_CONTENT_LENGTH + 100)}</p>"
         mock_get.return_value = mock_response
 
-        result = fetch_page("https://example.com/large")
+        with patch(
+            "app.tools._extract_page",
+            return_value=("Large page", "x" * (MAX_PAGE_CONTENT_LENGTH + 100)),
+        ):
+            result = fetch("https://example.com/large")
 
         self.assertEqual(len(result["content"]), MAX_PAGE_CONTENT_LENGTH)
+
+    @patch("app.tools._extract_page", return_value=("Title", "Readable text."))
+    @patch("app.tools.httpx.get")
+    def test_fetch_page_wrapper_uses_fetch_result(
+        self,
+        mock_get: Mock,
+        mock_extract: Mock,
+    ) -> None:
+        mock_response = Mock()
+        mock_response.text = "<html></html>"
+        mock_get.return_value = mock_response
+
+        result = fetch_page("https://example.com")
+
+        self.assertTrue(result["success"])
+        mock_extract.assert_called_once_with("<html></html>")
